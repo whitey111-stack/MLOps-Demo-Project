@@ -1,0 +1,110 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llama-7b-inference
+  namespace: ai-models
+  labels:
+    app: llama-7b
+    model: language-model
+    version: "1.0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: llama-7b
+  template:
+    metadata:
+      labels:
+        app: llama-7b
+        model: language-model
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+      serviceAccountName: ai-model-sa
+      containers:
+      - name: llama-inference
+        image: registry.redhat.io/ubi8/python-39:latest
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: MODEL_PATH
+          value: "/models/llama-7b"
+        - name: MAX_TOKENS
+          value: "2048"
+        - name: TEMPERATURE
+          value: "0.7"
+        - name: GPU_MEMORY_FRACTION
+          value: "0.8"
+        resources:
+          requests:
+            cpu: "4"
+            memory: "16Gi"
+            nvidia.com/gpu: "1"
+          limits:
+            cpu: "8"
+            memory: "32Gi"
+            nvidia.com/gpu: "1"
+        volumeMounts:
+        - name: model-storage
+          mountPath: /models
+          readOnly: true
+        - name: cache-storage
+          mountPath: /cache
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: llama-models-pvc
+      - name: cache-storage
+        persistentVolumeClaim:
+          claimName: inference-cache-pvc
+      nodeSelector:
+        accelerator: h100
+        node-type: gpu-worker
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-7b-service
+  namespace: ai-models
+spec:
+  selector:
+    app: llama-7b
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+  type: ClusterIP
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: llama-7b-route
+  namespace: ai-models
+spec:
+  to:
+    kind: Service
+    name: llama-7b-service
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

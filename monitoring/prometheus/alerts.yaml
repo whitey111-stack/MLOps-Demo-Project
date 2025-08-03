@@ -1,0 +1,82 @@
+groups:
+  - name: ai-model-alerts
+    rules:
+      - alert: ModelServiceDown
+        expr: up{job=~"llama-models|stable-diffusion"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: ai-inference
+        annotations:
+          summary: "AI Model service {{ $labels.instance }} is down"
+          description: "AI Model service {{ $labels.instance }} has been down for more than 2 minutes."
+
+      - alert: HighModelLatency
+        expr: histogram_quantile(0.95, rate(model_inference_duration_seconds_bucket[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+          service: ai-inference
+        annotations:
+          summary: "High inference latency on {{ $labels.instance }}"
+          description: "95th percentile latency is {{ $value }}s on {{ $labels.instance }}."
+
+      - alert: GPUMemoryHigh
+        expr: (nvidia_gpu_memory_used_bytes / nvidia_gpu_memory_total_bytes) * 100 > 90
+        for: 3m
+        labels:
+          severity: warning
+          component: gpu
+        annotations:
+          summary: "GPU memory usage is high"
+          description: "GPU memory usage is {{ $value }}% on {{ $labels.instance }}."
+
+      - alert: GPUUtilizationLow
+        expr: nvidia_gpu_utilization_gpu < 10
+        for: 15m
+        labels:
+          severity: info
+          component: gpu
+        annotations:
+          summary: "GPU utilization is low"
+          description: "GPU utilization is {{ $value }}% on {{ $labels.instance }} for more than 15 minutes."
+
+      - alert: ModelErrorRateHigh
+        expr: rate(model_errors_total[5m]) / rate(model_requests_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          service: ai-inference
+        annotations:
+          summary: "High error rate for AI model"
+          description: "Error rate is {{ $value | humanizePercentage }} on {{ $labels.instance }}."
+
+      - alert: PodCrashLooping
+        expr: rate(kube_pod_container_status_restarts_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: kubernetes
+        annotations:
+          summary: "Pod {{ $labels.pod }} is crash looping"
+          description: "Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} is restarting frequently."
+
+      - alert: NodeNotReady
+        expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          component: kubernetes
+        annotations:
+          summary: "Node {{ $labels.node }} is not ready"
+          description: "Node {{ $labels.node }} has been not ready for more than 5 minutes."
+
+      - alert: DiskSpaceRunningOut
+        expr: (node_filesystem_avail_bytes / node_filesystem_size_bytes) * 100 < 10
+        for: 5m
+        labels:
+          severity: warning
+          component: storage
+        annotations:
+          summary: "Disk space is running out on {{ $labels.instance }}"
+          description: "Filesystem {{ $labels.mountpoint }} on {{ $labels.instance }} has only {{ $value }}% space left."

@@ -1,0 +1,31 @@
+apiVersion: v2
+name: ai-models
+description: Comprehensive AI Model Deployment Suite for OpenShift
+type: application
+version: 1.0.0
+appVersion: "1.0"
+keywords:
+  - ai
+  - machine-learning
+  - llm
+  - stable-diffusion
+  - openshift
+  - gpu
+home: https://github.com/anonymous/mlops-portfolio
+sources:
+  - https://github.com/anonymous/mlops-portfolio
+maintainers:
+  - name: MLOps Engineer
+    email: mlops@example.com
+dependencies:
+  - name: prometheus
+    version: "25.8.0"
+    repository: "https://prometheus-community.github.io/helm-charts"
+    condition: monitoring.prometheus.enabled
+  - name: grafana
+    version: "7.3.7"
+    repository: "https://grafana.github.io/helm-charts"
+    condition: monitoring.grafana.enabled
+annotations:
+  category: MLOps
+  licenses: Apache-2.0

@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stable-diffusion-xl
+  namespace: ai-models
+  labels:
+    app: stable-diffusion-xl
+    model: diffusion-model
+    version: "1.0"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stable-diffusion-xl
+  template:
+    metadata:
+      labels:
+        app: stable-diffusion-xl
+        model: diffusion-model
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+      serviceAccountName: ai-model-sa
+      containers:
+      - name: diffusion-inference
+        image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: MODEL_ID
+          value: "stabilityai/stable-diffusion-xl-base-1.0"
+        - name: CACHE_DIR
+          value: "/cache/models"
+        - name: OUTPUT_DIR
+          value: "/outputs"
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: "max_split_size_mb:512"
+        resources:
+          requests:
+            cpu: "4"
+            memory: "24Gi"
+            nvidia.com/gpu: "1"
+          limits:
+            cpu: "8"
+            memory: "48Gi"
+            nvidia.com/gpu: "1"
+        volumeMounts:
+        - name: model-cache
+          mountPath: /cache
+        - name: output-storage
+          mountPath: /outputs
+        - name: huggingface-cache
+          mountPath: /root/.cache/huggingface
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 120
+          periodSeconds: 60
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        command:
+        - /bin/bash
+        - -c
+        - |
+          pip install diffusers transformers accelerate torch torchvision xformers
+          python /app/inference_server.py
+      volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: diffusion-cache-pvc
+      - name: output-storage
+        persistentVolumeClaim:
+          claimName: diffusion-outputs-pvc
+      - name: huggingface-cache
+        persistentVolumeClaim:
+          claimName: hf-cache-pvc
+      nodeSelector:
+        accelerator: h100
+        node-type: gpu-worker
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stable-diffusion-service
+  namespace: ai-models
+spec:
+  selector:
+    app: stable-diffusion-xl
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+  type: ClusterIP

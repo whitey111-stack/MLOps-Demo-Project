@@ -1,0 +1,248 @@
+---
+# Ansible playbook for GPU worker node configuration
+# Handles NVIDIA driver installation, Docker runtime setup, and Kubernetes integration
+
+- name: Configure GPU Worker Nodes for AI Workloads
+  hosts: gpu_workers
+  become: yes
+  vars:
+    nvidia_driver_version: "525.125.06"
+    cuda_version: "12.2"
+    container_runtime: "containerd"
+    k8s_version: "1.28"
+
+  tasks:
+    - name: Update system packages
+      yum:
+        name: "*"
+        state: latest
+        update_cache: yes
+
+    - name: Install required packages
+      yum:
+        name:
+          - kernel-devel
+          - kernel-headers
+          - gcc
+          - make
+          - dkms
+          - curl
+          - wget
+        state: present
+
+    - name: Add NVIDIA repository
+      yum_repository:
+        name: cuda
+        description: NVIDIA CUDA Repository
+        baseurl: https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/
+        gpgkey: https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/7fa2af80.pub
+        gpgcheck: yes
+        enabled: yes
+
+    - name: Install NVIDIA drivers
+      yum:
+        name: nvidia-driver-{{ nvidia_driver_version }}
+        state: present
+      notify: reboot system
+
+    - name: Install CUDA toolkit
+      yum:
+        name: cuda-toolkit-{{ cuda_version | replace('.', '-') }}
+        state: present
+
+    - name: Install NVIDIA Container Runtime
+      block:
+        - name: Add NVIDIA container runtime repository
+          yum_repository:
+            name: nvidia-container-runtime
+            description: NVIDIA Container Runtime Repository
+            baseurl: https://nvidia.github.io/nvidia-container-runtime/centos8/x86_64
+            gpgkey: https://nvidia.github.io/nvidia-container-runtime/gpgkey
+            gpgcheck: yes
+            enabled: yes
+
+        - name: Install NVIDIA container runtime
+          yum:
+            name: nvidia-container-runtime
+            state: present
+
+    - name: Configure containerd for GPU support
+      blockinfile:
+        path: /etc/containerd/config.toml
+        block: |
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia]
+            privileged_without_host_devices = false
+            runtime_engine = ""
+            runtime_root = ""
+            runtime_type = "io.containerd.runc.v2"
+            [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia.options]
+              BinaryName = "/usr/bin/nvidia-container-runtime"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - NVIDIA Runtime"
+      notify: restart containerd
+
+    - name: Install Kubernetes components
+      block:
+        - name: Add Kubernetes repository
+          yum_repository:
+            name: kubernetes
+            description: Kubernetes Repository
+            baseurl: https://packages.cloud.google.com/yum/repos/kubernetes-el7-x86_64
+            gpgkey: https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+            gpgcheck: yes
+            enabled: yes
+
+        - name: Install kubelet, kubeadm, kubectl
+          yum:
+            name:
+              - kubelet-{{ k8s_version }}.*
+              - kubeadm-{{ k8s_version }}.*
+              - kubectl-{{ k8s_version }}.*
+            state: present
+
+        - name: Hold Kubernetes packages
+          shell: yum versionlock kubelet kubeadm kubectl
+
+    - name: Configure kubelet for GPU
+      lineinfile:
+        path: /etc/sysconfig/kubelet
+        regexp: '^KUBELET_EXTRA_ARGS='
+        line: 'KUBELET_EXTRA_ARGS=--container-runtime=remote --container-runtime-endpoint=unix:///run/containerd/containerd.sock --feature-gates=DevicePlugins=true'
+      notify: restart kubelet
+
+    - name: Enable and start services
+      systemd:
+        name: "{{ item }}"
+        enabled: yes
+        state: started
+      loop:
+        - containerd
+        - kubelet
+
+    - name: Install NVIDIA Device Plugin
+      k8s:
+        definition:
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata:
+            name: nvidia-device-plugin-daemonset
+            namespace: kube-system
+          spec:
+            selector:
+              matchLabels:
+                name: nvidia-device-plugin-ds
+            updateStrategy:
+              type: RollingUpdate
+            template:
+              metadata:
+                labels:
+                  name: nvidia-device-plugin-ds
+              spec:
+                tolerations:
+                - key: nvidia.com/gpu
+                  operator: Exists
+                  effect: NoSchedule
+                nodeSelector:
+                  accelerator: h100
+                containers:
+                - image: nvcr.io/nvidia/k8s-device-plugin:v0.14.1
+                  name: nvidia-device-plugin-ctr
+                  args: ["--fail-on-init-error=false"]
+                  securityContext:
+                    allowPrivilegeEscalation: false
+                    capabilities:
+                      drop: ["ALL"]
+                  volumeMounts:
+                  - name: device-plugin
+                    mountPath: /var/lib/kubelet/device-plugins
+                volumes:
+                - name: device-plugin
+                  hostPath:
+                    path: /var/lib/kubelet/device-plugins
+
+    - name: Install GPU monitoring tools
+      block:
+        - name: Install DCGM Exporter
+          k8s:
+            definition:
+              apiVersion: apps/v1
+              kind: DaemonSet
+              metadata:
+                name: dcgm-exporter
+                namespace: monitoring
+              spec:
+                selector:
+                  matchLabels:
+                    app.kubernetes.io/name: dcgm-exporter
+                template:
+                  metadata:
+                    labels:
+                      app.kubernetes.io/name: dcgm-exporter
+                  spec:
+                    tolerations:
+                    - key: nvidia.com/gpu
+                      operator: Exists
+                      effect: NoSchedule
+                    nodeSelector:
+                      accelerator: h100
+                    containers:
+                    - name: dcgm-exporter
+                      image: nvcr.io/nvidia/k8s/dcgm-exporter:3.1.8-3.1.5-ubuntu20.04
+                      ports:
+                      - name: metrics
+                        containerPort: 9400
+                      securityContext:
+                        runAsNonRoot: false
+                        runAsUser: 0
+                      volumeMounts:
+                      - name: proc
+                        mountPath: /host/proc
+                        readOnly: true
+                      - name: sys
+                        mountPath: /host/sys
+                        readOnly: true
+                    volumes:
+                    - name: proc
+                      hostPath:
+                        path: /proc
+                    - name: sys
+                      hostPath:
+                        path: /sys
+
+    - name: Configure firewall for Kubernetes
+      firewalld:
+        port: "{{ item }}"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop:
+        - "10250/tcp"  # kubelet
+        - "30000-32767/tcp"  # NodePort services
+      when: ansible_facts['os_family'] == "RedHat"
+
+    - name: Label GPU nodes
+      k8s:
+        definition:
+          apiVersion: v1
+          kind: Node
+          metadata:
+            name: "{{ inventory_hostname }}"
+            labels:
+              accelerator: h100
+              node-type: gpu-worker
+              workload: ai-inference
+      delegate_to: localhost
+
+  handlers:
+    - name: reboot system
+      reboot:
+        reboot_timeout: 600
+
+    - name: restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+
+    - name: restart kubelet
+      systemd:
+        name: kubelet
+        state: restarted

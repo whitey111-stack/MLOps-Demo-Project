@@ -1,0 +1,147 @@
+# Default values for ai-models chart
+global:
+  imageRegistry: ""
+  imagePullSecrets: []
+  storageClass: "fast-ssd"
+
+# LLaMA Configuration
+llama:
+  enabled: true
+  replicaCount: 2
+  model:
+    size: "7b"  # Options: 7b, 13b, 70b
+    precision: "fp16"  # Options: fp32, fp16, int8, int4
+  resources:
+    requests:
+      cpu: "4"
+      memory: "16Gi"
+      nvidia.com/gpu: "1"
+    limits:
+      cpu: "8" 
+      memory: "32Gi"
+      nvidia.com/gpu: "1"
+  storage:
+    size: "100Gi"
+    accessMode: ReadOnlyMany
+  service:
+    type: ClusterIP
+    port: 80
+  route:
+    enabled: true
+    host: ""
+    tls: true
+
+# Stable Diffusion Configuration  
+stableDiffusion:
+  enabled: true
+  replicaCount: 1
+  model:
+    variant: "xl"  # Options: base, xl, turbo
+    precision: "fp16"
+  resources:
+    requests:
+      cpu: "4"
+      memory: "24Gi"
+      nvidia.com/gpu: "1"
+    limits:
+      cpu: "8"
+      memory: "48Gi"
+      nvidia.com/gpu: "1"
+  storage:
+    cache:
+      size: "200Gi"
+    outputs:
+      size: "500Gi"
+  service:
+    type: ClusterIP
+    port: 80
+
+# Security Configuration
+security:
+  serviceAccount:
+    create: true
+    name: "ai-model-sa"
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1001
+    fsGroup: 1001
+  networkPolicies:
+    enabled: true
+  podSecurityPolicy:
+    enabled: true
+
+# Storage Configuration
+storage:
+  provisioner: "kubernetes.io/aws-ebs"
+  reclaimPolicy: Retain
+  volumeBindingMode: WaitForFirstConsumer
+  allowVolumeExpansion: true
+
+# Node Selection
+nodeSelector:
+  accelerator: "h100"
+  node-type: "gpu-worker"
+
+tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+  - key: "node-role.kubernetes.io/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+
+# Monitoring & Observability
+monitoring:
+  enabled: true
+  prometheus:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      interval: 30s
+  grafana:
+    enabled: true
+    dashboards:
+      enabled: true
+  alerts:
+    enabled: true
+    rules:
+      - name: "model-health"
+        rules:
+          - alert: ModelDown
+            expr: up{job="ai-models"} == 0
+            for: 5m
+            annotations:
+              summary: "AI Model {{ $labels.instance }} is down"
+          - alert: HighGPUMemory
+            expr: nvidia_gpu_memory_used_bytes / nvidia_gpu_memory_total_bytes > 0.9
+            for: 2m
+            annotations:
+              summary: "GPU memory usage is above 90%"
+
+# Auto-scaling Configuration
+autoscaling:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+# Backup Configuration
+backup:
+  enabled: true
+  schedule: "0 2 * * *"
+  retention: "30d"
+  storage:
+    size: "1Ti"
+    accessMode: ReadWriteOnce

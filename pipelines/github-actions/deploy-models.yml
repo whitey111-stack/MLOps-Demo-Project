@@ -1,0 +1,298 @@
+name: Deploy AI Models to OpenShift
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'deployments/**'
+      - 'infrastructure/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'deployments/**'
+      - 'infrastructure/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      model_variant:
+        description: 'Model variant to deploy'
+        required: true
+        default: 'llama-7b'
+        type: choice
+        options:
+          - llama-7b
+          - llama-13b
+          - llama-70b
+          - stable-diffusion-xl
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  OPENSHIFT_SERVER: ${{ secrets.OPENSHIFT_SERVER }}
+  OPENSHIFT_TOKEN: ${{ secrets.OPENSHIFT_TOKEN }}
+  OPENSHIFT_NAMESPACE: ai-models
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  validate-manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Kubernetes tools
+        uses: azure/setup-kubectl@v3
+        with:
+          version: '1.28.0'
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: '3.12.0'
+
+      - name: Validate Kubernetes manifests
+        run: |
+          find deployments/ -name "*.yaml" -exec kubectl --dry-run=client apply -f {} \;
+
+      - name: Lint Helm charts
+        run: |
+          helm lint deployments/helm/ai-models/
+
+      - name: Validate Helm templates
+        run: |
+          helm template test deployments/helm/ai-models/ --validate
+
+  build-and-push:
+    needs: [security-scan, validate-manifests]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-to-staging:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event.inputs.environment == 'staging'
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup OpenShift CLI
+        uses: redhat-actions/openshift-tools-installer@v1
+        with:
+          oc: '4.13'
+
+      - name: Login to OpenShift
+        run: |
+          oc login --token=${{ secrets.OPENSHIFT_TOKEN }} --server=${{ secrets.OPENSHIFT_SERVER }}
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: '3.12.0'
+
+      - name: Deploy to staging namespace
+        run: |
+          oc project ai-models-staging || oc new-project ai-models-staging
+          
+          # Apply RBAC and security policies
+          oc apply -f deployments/openshift/rbac/
+          
+          # Deploy with Helm
+          helm upgrade --install ai-models-staging deployments/helm/ai-models/ \
+            --namespace ai-models-staging \
+            --values deployments/helm/ai-models/values-staging.yaml \
+            --set global.imageTag=${{ github.sha }} \
+            --set llama.enabled=true \
+            --set stableDiffusion.enabled=false \
+            --wait --timeout=10m
+
+      - name: Run health checks
+        run: |
+          # Wait for deployments to be ready
+          oc rollout status deployment/llama-7b-inference -n ai-models-staging --timeout=600s
+          
+          # Test model endpoints
+          MODEL_URL=$(oc get route llama-7b-route -n ai-models-staging -o jsonpath='{.spec.host}')
+          curl -f https://$MODEL_URL/health || exit 1
+
+      - name: Run performance tests
+        run: |
+          # Basic load test
+          MODEL_URL=$(oc get route llama-7b-route -n ai-models-staging -o jsonpath='{.spec.host}')
+          for i in {1..10}; do
+            curl -X POST https://$MODEL_URL/generate \
+              -H "Content-Type: application/json" \
+              -d '{"prompt": "Hello, world!", "max_tokens": 10}' \
+              -w "Time: %{time_total}s\n" || exit 1
+          done
+
+  deploy-to-production:
+    needs: [build-and-push, deploy-to-staging]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' || github.event.inputs.environment == 'production'
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup OpenShift CLI
+        uses: redhat-actions/openshift-tools-installer@v1
+        with:
+          oc: '4.13'
+
+      - name: Login to OpenShift
+        run: |
+          oc login --token=${{ secrets.OPENSHIFT_TOKEN_PROD }} --server=${{ secrets.OPENSHIFT_SERVER_PROD }}
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: '3.12.0'
+
+      - name: Blue-Green Deployment
+        run: |
+          oc project ai-models-prod || oc new-project ai-models-prod
+          
+          # Check current deployment
+          CURRENT_DEPLOYMENT=$(oc get deployment -l app.kubernetes.io/instance=ai-models-prod -o name | head -1)
+          
+          if [ -n "$CURRENT_DEPLOYMENT" ]; then
+            # Blue-Green deployment
+            echo "Performing blue-green deployment"
+            
+            # Deploy new version (green)
+            helm upgrade --install ai-models-prod-green deployments/helm/ai-models/ \
+              --namespace ai-models-prod \
+              --values deployments/helm/ai-models/values-production.yaml \
+              --set global.imageTag=${{ github.sha }} \
+              --set nameOverride="green" \
+              --wait --timeout=15m
+            
+            # Health check on green deployment
+            sleep 30
+            GREEN_URL=$(oc get route llama-7b-route-green -n ai-models-prod -o jsonpath='{.spec.host}')
+            curl -f https://$GREEN_URL/health || exit 1
+            
+            # Switch traffic to green
+            oc patch route llama-7b-route -n ai-models-prod -p '{"spec":{"to":{"name":"llama-7b-service-green"}}}'
+            
+            # Wait and verify
+            sleep 60
+            
+            # Remove blue deployment
+            helm uninstall ai-models-prod || true
+            
+            # Rename green to main
+            helm upgrade --install ai-models-prod deployments/helm/ai-models/ \
+              --namespace ai-models-prod \
+              --values deployments/helm/ai-models/values-production.yaml \
+              --set global.imageTag=${{ github.sha }}
+          else
+            # Initial deployment
+            helm upgrade --install ai-models-prod deployments/helm/ai-models/ \
+              --namespace ai-models-prod \
+              --values deployments/helm/ai-models/values-production.yaml \
+              --set global.imageTag=${{ github.sha }} \
+              --wait --timeout=15m
+          fi
+
+      - name: Post-deployment verification
+        run: |
+          # Verify all services are healthy
+          oc rollout status deployment/llama-7b-inference -n ai-models-prod --timeout=600s
+          oc rollout status deployment/stable-diffusion-xl -n ai-models-prod --timeout=600s
+          
+          # Test endpoints
+          LLAMA_URL=$(oc get route llama-7b-route -n ai-models-prod -o jsonpath='{.spec.host}')
+          SD_URL=$(oc get route stable-diffusion-route -n ai-models-prod -o jsonpath='{.spec.host}')
+          
+          curl -f https://$LLAMA_URL/health || exit 1
+          curl -f https://$SD_URL/health || exit 1
+          
+          echo "Production deployment successful!"
+
+  notify:
+    needs: [deploy-to-production]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Notify Slack on Success
+        if: needs.deploy-to-production.result == 'success'
+        uses: 8398a7/action-slack@v3
+        with:
+          status: success
+          text: 'AI Models successfully deployed to production! 🚀'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+      - name: Notify Slack on Failure
+        if: needs.deploy-to-production.result == 'failure'
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          text: 'Production deployment failed! Please check the logs. ❌'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
